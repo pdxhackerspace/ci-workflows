@@ -7,11 +7,12 @@ behaviour cannot drift between projects.
 ## Principles
 
 **The newest `v*` git tag is the version.** No repository using these workflows should
-contain a `VERSION` file, and no commit should ever hand-edit a version number. A release
-is a button, not a branch.
+contain a `VERSION` file, and no commit should ever hand-edit a version number.
 
 **Releases are triggered, not merged.** Merging to the release branch makes code eligible
-to ship; a separate manual run decides when and at what version.
+to ship. Someone then runs the release workflow by hand — from the repository's Actions tab
+(**Actions** → the workflow → **Run workflow**) or with `gh workflow run` — and that run
+decides when to ship and at what version.
 
 **The workflow does not change between solo and team projects.** Everything is a short-lived
 branch, a pull request, and passing checks. The only thing that differs is
@@ -80,7 +81,8 @@ jobs:
       image-name: ${{ github.repository_owner }}/my-app
 ```
 
-Then:
+Declaring `workflow_dispatch` on the caller is what makes the workflow manually runnable, so
+it appears in the repository's **Actions** tab with a **Run workflow** button. Equivalently:
 
 ```bash
 gh workflow run release.yml -f bump=minor

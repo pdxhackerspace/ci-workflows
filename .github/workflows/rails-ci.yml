@@ -1,0 +1,145 @@
+name: Rails CI
+
+# Reusable lint-and-test workflow for Rails projects.
+#
+# Callers:
+#   jobs:
+#     ci:
+#       uses: pdxhackerspace/ci-workflows/.github/workflows/rails-ci.yml@v1
+#       with:
+#         ruby-version: '4.0.6'
+#         node-version: '24'
+#         postgres: true
+#         redis: true
+
+on:
+  workflow_call:
+    inputs:
+      ruby-version:
+        description: 'Ruby version, or omit to use .ruby-version'
+        type: string
+        required: false
+      node-version:
+        description: 'Node version. Empty string skips all JS setup.'
+        type: string
+        default: '24'
+      postgres:
+        description: 'Run a PostgreSQL service container'
+        type: boolean
+        default: true
+      postgres-image:
+        type: string
+        default: 'postgres:16'
+      redis:
+        description: 'Run a Redis service container'
+        type: boolean
+        default: false
+      redis-image:
+        type: string
+        default: 'redis:8-alpine'
+      database-name:
+        type: string
+        default: 'app_test'
+      apt-packages:
+        description: 'Extra apt packages, space separated (e.g. libvips)'
+        type: string
+        default: ''
+      lint-command:
+        type: string
+        default: 'bundle exec rubocop'
+      js-test-command:
+        description: 'Empty string skips JS tests'
+        type: string
+        default: ''
+      test-command:
+        type: string
+        default: 'bin/rails test'
+      extra-env:
+        description: 'Extra env as KEY=VALUE lines, appended to $GITHUB_ENV'
+        type: string
+        default: ''
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # Service containers cannot be conditional, so the image is emptied
+        # instead when postgres is not wanted; an empty image is not started.
+        image: ${{ inputs.postgres && inputs.postgres-image || '' }}
+        env:
+          POSTGRES_DB: ${{ inputs.database-name }}
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: ${{ inputs.redis && inputs.redis-image || '' }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      RAILS_ENV: test
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Apply extra environment
+        if: inputs.extra-env != ''
+        run: printf '%s\n' "${{ inputs.extra-env }}" >> "$GITHUB_ENV"
+
+      - name: Install apt packages
+        if: inputs.apt-packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ${{ inputs.apt-packages }}
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ inputs.ruby-version }}
+          bundler-cache: true
+
+      - name: Set up Node.js
+        if: inputs.node-version != ''
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'yarn'
+
+      - name: Install JS dependencies
+        if: inputs.node-version != ''
+        run: yarn install --frozen-lockfile
+
+      - name: Lint
+        if: inputs.lint-command != ''
+        run: ${{ inputs.lint-command }}
+
+      - name: JavaScript tests
+        if: inputs.js-test-command != ''
+        run: ${{ inputs.js-test-command }}
+
+      - name: Prepare database
+        if: inputs.postgres
+        run: bin/rails db:test:prepare
+
+      - name: Tests
+        run: ${{ inputs.test-command }}

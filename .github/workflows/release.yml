@@ -1,0 +1,206 @@
+name: Release
+
+# Reusable tag-driven release. The newest v* git tag is the source of truth for
+# the current version; there is no VERSION file anywhere.
+#
+# Computes the next semver, builds the image with it baked in as APP_VERSION,
+# publishes :latest / :X.Y.Z / :MAJOR, then tags the commit and opens a Release.
+#
+# Callers:
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         bump: { type: choice, options: [patch, minor, major], required: true }
+#         sha: { type: string, required: false }
+#         dry_run: { type: boolean, default: false }
+#   jobs:
+#     release:
+#       uses: pdxhackerspace/ci-workflows/.github/workflows/release.yml@v1
+#       with:
+#         bump: ${{ inputs.bump }}
+#         sha: ${{ inputs.sha }}
+#         dry_run: ${{ inputs.dry_run }}
+#         image-name: ${{ github.repository_owner }}/my-app
+
+on:
+  workflow_call:
+    inputs:
+      bump:
+        description: 'patch | minor | major'
+        type: string
+        required: true
+      sha:
+        description: 'Commit on the release branch (default: its tip)'
+        type: string
+        required: false
+      dry_run:
+        type: boolean
+        default: false
+      release-branch:
+        type: string
+        default: 'main'
+      image-name:
+        description: 'Image path under the registry, e.g. my-org/my-app'
+        type: string
+        required: true
+      registry:
+        type: string
+        default: 'ghcr.io'
+      dockerfile:
+        type: string
+        default: 'Dockerfile'
+      platforms:
+        type: string
+        default: 'linux/amd64'
+      push-major-tag:
+        description: 'Also publish the bare MAJOR tag'
+        type: boolean
+        default: true
+    outputs:
+      version:
+        value: ${{ jobs.plan.outputs.version }}
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      major: ${{ steps.plan.outputs.major }}
+      sha: ${{ steps.plan.outputs.sha }}
+      short_sha: ${{ steps.plan.outputs.short_sha }}
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release-branch }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve commit and next version
+        id: plan
+        env:
+          BUMP: ${{ inputs.bump }}
+          REQUESTED_SHA: ${{ inputs.sha }}
+          BRANCH: ${{ inputs.release-branch }}
+        run: |
+          set -euo pipefail
+
+          SHA=$(git rev-parse "${REQUESTED_SHA:-HEAD}")
+          if ! git merge-base --is-ancestor "$SHA" HEAD; then
+            echo "::error::$SHA is not an ancestor of $BRANCH; only commits on $BRANCH can be released."
+            exit 1
+          fi
+
+          # awk rather than `head -1`: head closes the pipe early and trips pipefail.
+          LATEST=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | awk 'NR==1')
+          CURRENT="${LATEST#v}"
+          CURRENT="${CURRENT:-0.0.0}"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<<"${CURRENT%%-*}"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+            *) echo "::error::Unknown bump '$BUMP'; expected patch, minor, or major."; exit 1 ;;
+          esac
+          VERSION="$MAJOR.$MINOR.$PATCH"
+
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::Tag v$VERSION already exists."
+            exit 1
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "major=$MAJOR"
+            echo "sha=$SHA"
+            echo "short_sha=$(git rev-parse --short "$SHA")"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Release plan"
+            echo ''
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| previous | \`${LATEST:-none}\` |"
+            echo "| next | \`v$VERSION\` |"
+            echo "| commit | \`$SHA\` |"
+            echo "| dry run | \`${{ inputs.dry_run }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: plan
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ${{ inputs.registry }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      MAJOR: ${{ needs.plan.outputs.major }}
+      SHORT_SHA: ${{ needs.plan.outputs.short_sha }}
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Log in to registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Assemble image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          {
+            echo "list<<EOF"
+            echo "$REGISTRY/$IMAGE_NAME:latest"
+            echo "$REGISTRY/$IMAGE_NAME:$VERSION"
+            if [ "${{ inputs.push-major-tag }}" = 'true' ]; then
+              echo "$REGISTRY/$IMAGE_NAME:$MAJOR"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          provenance: false
+          build-args: |
+            APP_VERSION=${{ env.VERSION }}+${{ env.SHORT_SHA }}
+          tags: ${{ steps.tags.outputs.list }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Tag only after the image is published, so a failed build leaves no tag behind.
+      - name: Tag commit and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" --title "v$VERSION" --generate-notes
+
+          {
+            echo "### Released \`v$VERSION\`"
+            echo ''
+            printf '%s\n' '${{ steps.tags.outputs.list }}' | sed 's/^/- `/; s/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"

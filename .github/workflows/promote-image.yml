@@ -1,0 +1,201 @@
+name: Promote image
+
+# Promotes an already-built candidate to a release without rebuilding the app.
+#
+# The next semver comes from the newest v* git tag. The candidate is re-published
+# through a two-line overlay:
+#
+#     FROM <candidate>
+#     ENV APP_VERSION=<version>+<sha>
+#
+# ENV is a metadata-only instruction — it creates a new image config but no new
+# filesystem layer. Every layer blob is already in the registry, so the push is a
+# config and a manifest: kilobytes and a couple of seconds. The application bits
+# are provably the same as the candidate that was tested, because they are the
+# same layer digests, while the app still self-reports a real semver.
+#
+# Pair with build-image.yml, which produces the candidates.
+
+on:
+  workflow_call:
+    inputs:
+      bump:
+        description: 'patch | minor | major'
+        type: string
+        required: true
+      candidate:
+        description: 'Candidate image to promote, e.g. ghcr.io/org/app:main-abc1234'
+        type: string
+        required: true
+      image-name:
+        type: string
+        required: true
+      registry:
+        type: string
+        default: 'ghcr.io'
+      release-branch:
+        type: string
+        default: 'main'
+      sha:
+        description: 'Commit the candidate was built from, for tagging'
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+      push-major-tag:
+        type: boolean
+        default: true
+    outputs:
+      version:
+        value: ${{ jobs.promote.outputs.version }}
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+    env:
+      REGISTRY: ${{ inputs.registry }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release-branch }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve next version
+        id: plan
+        env:
+          BUMP: ${{ inputs.bump }}
+          SHA: ${{ inputs.sha }}
+          BRANCH: ${{ inputs.release-branch }}
+        run: |
+          set -euo pipefail
+
+          RESOLVED=$(git rev-parse "$SHA")
+          if ! git merge-base --is-ancestor "$RESOLVED" HEAD; then
+            echo "::error::$RESOLVED is not an ancestor of $BRANCH."
+            exit 1
+          fi
+
+          LATEST=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | awk 'NR==1')
+          CURRENT="${LATEST#v}"
+          CURRENT="${CURRENT:-0.0.0}"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<<"${CURRENT%%-*}"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+            *) echo "::error::Unknown bump '$BUMP'; expected patch, minor, or major."; exit 1 ;;
+          esac
+          VERSION="$MAJOR.$MINOR.$PATCH"
+
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::Tag v$VERSION already exists."
+            exit 1
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "major=$MAJOR"
+            echo "sha=$RESOLVED"
+            echo "short_sha=$(git rev-parse --short "$RESOLVED")"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Promotion plan"
+            echo ''
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| candidate | \`${{ inputs.candidate }}\` |"
+            echo "| previous | \`${LATEST:-none}\` |"
+            echo "| next | \`v$VERSION\` |"
+            echo "| dry run | \`${{ inputs.dry_run }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to registry
+        if: ${{ !inputs.dry_run }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the candidate exists
+        if: ${{ !inputs.dry_run }}
+        run: docker buildx imagetools inspect '${{ inputs.candidate }}' >/dev/null
+
+      - name: Set up Docker Buildx
+        if: ${{ !inputs.dry_run }}
+        uses: docker/setup-buildx-action@v4
+
+      - name: Write the version overlay
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          SHORT_SHA: ${{ steps.plan.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p .promote
+          {
+            echo "FROM ${{ inputs.candidate }}"
+            echo "ENV APP_VERSION=${VERSION}+${SHORT_SHA}"
+          } > .promote/Dockerfile
+          cat .promote/Dockerfile
+
+      - name: Assemble release tags
+        if: ${{ !inputs.dry_run }}
+        id: tags
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          MAJOR: ${{ steps.plan.outputs.major }}
+        run: |
+          set -euo pipefail
+          {
+            echo "list<<EOF"
+            echo "$REGISTRY/$IMAGE_NAME:latest"
+            echo "$REGISTRY/$IMAGE_NAME:$VERSION"
+            if [ "${{ inputs.push-major-tag }}" = 'true' ]; then
+              echo "$REGISTRY/$IMAGE_NAME:$MAJOR"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release tags
+        if: ${{ !inputs.dry_run }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .promote
+          file: .promote/Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.tags.outputs.list }}
+
+      # Tag only after the image is published, so a failed promotion leaves no tag.
+      - name: Tag commit and publish release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          SHA: ${{ steps.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -a "v$VERSION" -m "v$VERSION" "$SHA"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" --title "v$VERSION" --generate-notes --target "$SHA"
+
+          {
+            echo "### Promoted to \`v$VERSION\`"
+            echo ''
+            printf '%s\n' '${{ steps.tags.outputs.list }}' | sed 's/^/- `/; s/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"

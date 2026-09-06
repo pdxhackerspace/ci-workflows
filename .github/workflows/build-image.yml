@@ -1,0 +1,143 @@
+name: Build image
+
+# Builds one immutable release candidate per commit and optionally moves a
+# floating tag (e.g. :staging) to it.
+#
+# The candidate is tagged :<prefix>-<short-sha> and never overwritten, so every
+# commit that ever landed stays deployable and rollback is a re-tag rather than a
+# rebuild. APP_VERSION is anchored to the newest release tag in the repo, giving a
+# version humans can compare against production, e.g. 0.50.1+109.abc1234.staging.
+#
+# Pair with promote-image.yml, which re-tags a candidate as a release.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: 'Image path under the registry, e.g. my-org/my-app'
+        type: string
+        required: true
+      registry:
+        type: string
+        default: 'ghcr.io'
+      dockerfile:
+        type: string
+        default: 'Dockerfile'
+      platforms:
+        type: string
+        default: 'linux/amd64'
+      ref:
+        description: 'Commit to build (default: the triggering ref)'
+        type: string
+        required: false
+      candidate-prefix:
+        description: 'Prefix for the immutable per-commit tag'
+        type: string
+        default: 'main'
+      floating-tag:
+        description: 'Mutable tag to move to this build, e.g. staging. Empty to skip.'
+        type: string
+        default: ''
+      version-suffix:
+        description: 'Appended to APP_VERSION build metadata, e.g. staging'
+        type: string
+        default: ''
+    outputs:
+      image:
+        description: 'Fully qualified immutable image reference'
+        value: ${{ jobs.build.outputs.image }}
+      app-version:
+        value: ${{ jobs.build.outputs.app_version }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      app_version: ${{ steps.meta.outputs.app_version }}
+    env:
+      REGISTRY: ${{ inputs.registry }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          # Full history and tags so the version can be anchored to the newest tag.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve build identity
+        id: meta
+        env:
+          SUFFIX: ${{ inputs.version-suffix }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(git rev-parse --short HEAD)
+
+          # Anchor to the newest release tag in the repo rather than using
+          # `git describe`: describe walks ancestry, so on a branch that has
+          # diverged from the release branch it anchors to a much older tag and
+          # makes the build look older than production.
+          # awk rather than `head -1`, which trips pipefail.
+          LATEST=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | awk 'NR==1')
+          if [ -n "$LATEST" ]; then
+            COUNT=$(git rev-list --count "${LATEST}..HEAD")
+            APP_VERSION="${LATEST#v}+${COUNT}.${SHORT_SHA}"
+          else
+            APP_VERSION="0.0.0+${SHORT_SHA}"
+          fi
+          [ -n "$SUFFIX" ] && APP_VERSION="${APP_VERSION}.${SUFFIX}"
+
+          CANDIDATE="$REGISTRY/$IMAGE_NAME:${{ inputs.candidate-prefix }}-$SHORT_SHA"
+
+          {
+            echo "short_sha=$SHORT_SHA"
+            echo "app_version=$APP_VERSION"
+            echo "image=$CANDIDATE"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "list<<EOF"
+            echo "$CANDIDATE"
+            if [ -n '${{ inputs.floating-tag }}' ]; then
+              echo "$REGISTRY/$IMAGE_NAME:${{ inputs.floating-tag }}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          provenance: false
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.app_version }}
+          tags: ${{ steps.meta.outputs.list }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarise
+        run: |
+          {
+            echo "### Built \`${{ steps.meta.outputs.app_version }}\`"
+            echo ''
+            printf '%s\n' '${{ steps.meta.outputs.list }}' | sed 's/^/- `/; s/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"

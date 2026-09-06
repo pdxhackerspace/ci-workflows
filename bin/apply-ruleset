@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#
+# Apply a ruleset from rulesets/ to one or more repositories.
+#
+#   bin/apply-ruleset main-solo pdxhackerspace/member-zone
+#   bin/apply-ruleset main-team  pdxhackerspace/member-zone pdxhackerspace/other
+#   bin/apply-ruleset main-solo --all pdxhackerspace
+#
+# Creates the ruleset if absent, updates it in place if a ruleset with the same
+# name already exists, so re-running is safe. Pass --dry-run to print only.
+
+set -euo pipefail
+
+usage() {
+  echo "usage: $0 <ruleset-name> [--dry-run] (<owner/repo>... | --all <owner>)" >&2
+  exit 2
+}
+
+[ $# -ge 2 ] || usage
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+NAME="$1"; shift
+FILE="$ROOT/rulesets/$NAME.json"
+
+[ -f "$FILE" ] || { echo "no such ruleset: $FILE" >&2; exit 1; }
+
+DRY_RUN=false
+if [ "${1:-}" = '--dry-run' ]; then
+  DRY_RUN=true
+  shift
+fi
+
+repos=()
+if [ "${1:-}" = '--all' ]; then
+  [ $# -eq 2 ] || usage
+  while IFS= read -r line; do
+    repos+=("$line")
+  done < <(gh repo list "$2" --no-archived --limit 200 --json nameWithOwner -q '.[].nameWithOwner')
+else
+  repos=("$@")
+fi
+
+[ ${#repos[@]} -gt 0 ] || { echo 'no repositories matched' >&2; exit 1; }
+
+RULESET_TITLE="$(jq -r .name "$FILE")"
+
+for repo in "${repos[@]}"; do
+  existing=$(gh api "repos/$repo/rulesets" --jq \
+    ".[] | select(.name == \"$RULESET_TITLE\") | .id" 2>/dev/null | head -1 || true)
+
+  if $DRY_RUN; then
+    if [ -n "$existing" ]; then
+      echo "would update $repo ruleset '$RULESET_TITLE' (id $existing)"
+    else
+      echo "would create $repo ruleset '$RULESET_TITLE'"
+    fi
+    continue
+  fi
+
+  if [ -n "$existing" ]; then
+    gh api --silent --method PUT "repos/$repo/rulesets/$existing" --input "$FILE"
+    echo "updated $repo ($RULESET_TITLE)"
+  else
+    gh api --silent --method POST "repos/$repo/rulesets" --input "$FILE"
+    echo "created $repo ($RULESET_TITLE)"
+  fi
+done
